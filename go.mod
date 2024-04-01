@@ -8,8 +8,8 @@ require github.com/onsi/gomega v1.27.5
 require go.uber.org/zap v1.26.0
 
 require (
-	go.etcd.io/etcd/client/v3 v3.5.12
-	go.etcd.io/etcd/server/v3 v3.5.12
+	go.etcd.io/etcd/client/v3 v3.5.11
+	go.etcd.io/etcd/server/v3 v3.5.11
 )
 
 require (
@@ -49,8 +49,8 @@ require (
 	go.etcd.io/etcd/api/v3 v3.5.12 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.12 // indirect
 	go.etcd.io/etcd/client/v2 v2.305.12 // indirect
-	go.etcd.io/etcd/pkg/v3 v3.5.12 // indirect
-	go.etcd.io/etcd/raft/v3 v3.5.12 // indirect
+	go.etcd.io/etcd/pkg/v3 v3.5.11 // indirect
+	go.etcd.io/etcd/raft/v3 v3.5.11 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.46.0 // indirect
 	go.opentelemetry.io/otel v1.20.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.20.0 // indirect
@@ -79,3 +79,7 @@ require (
 
 // Ref: https://github.com/etcd-io/etcd/issues/11707
 // replace google.golang.org/grpc => google.golang.org/grpc v1.29.1
+replace (
+	go.etcd.io/etcd/api/v3 => go.etcd.io/etcd/api/v3 v3.5.11
+	go.etcd.io/etcd/client/pkg/v3 => go.etcd.io/etcd/client/pkg/v3 v3.5.11
+)
