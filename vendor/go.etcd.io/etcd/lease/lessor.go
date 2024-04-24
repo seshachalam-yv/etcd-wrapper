@@ -78,7 +78,7 @@ type RangeDeleter func() TxnDelete
 
 // Checkpointer permits checkpointing of lease remaining TTLs to the consensus log. Defined here to
 // avoid circular dependency with mvcc.
-type Checkpointer func(ctx context.Context, lc *pb.LeaseCheckpointRequest)
+type Checkpointer func(ctx context.Context, lc *pb.LeaseCheckpointRequest) error
 
 type LeaseID int64
 
@@ -282,12 +282,7 @@ func (le *lessor) Grant(id LeaseID, ttl int64) (*Lease, error) {
 
 	// TODO: when lessor is under high load, it should give out lease
 	// with longer TTL to reduce renew load.
-	l := &Lease{
-		ID:      id,
-		ttl:     ttl,
-		itemSet: make(map[LeaseItem]struct{}),
-		revokec: make(chan struct{}),
-	}
+	l := NewLease(id, ttl)
 
 	le.mu.Lock()
 	defer le.mu.Unlock()
@@ -429,7 +424,9 @@ func (le *lessor) Renew(id LeaseID) (int64, error) {
 	// By applying a RAFT entry only when the remainingTTL is already set, we limit the number
 	// of RAFT entries written per lease to a max of 2 per checkpoint interval.
 	if clearRemainingTTL {
-		le.cp(context.Background(), &pb.LeaseCheckpointRequest{Checkpoints: []*pb.LeaseCheckpoint{{ID: int64(l.ID), Remaining_TTL: 0}}})
+		if err := le.cp(context.Background(), &pb.LeaseCheckpointRequest{Checkpoints: []*pb.LeaseCheckpoint{{ID: int64(l.ID), Remaining_TTL: 0}}}); err != nil {
+			return -1, err
+		}
 	}
 
 	le.mu.Lock()
@@ -665,7 +662,9 @@ func (le *lessor) checkpointScheduledLeases() {
 		le.mu.Unlock()
 
 		if len(cps) != 0 {
-			le.cp(context.Background(), &pb.LeaseCheckpointRequest{Checkpoints: cps})
+			if err := le.cp(context.Background(), &pb.LeaseCheckpointRequest{Checkpoints: cps}); err != nil {
+				return
+			}
 		}
 		if len(cps) < maxLeaseCheckpointBatchSize {
 			return
@@ -840,6 +839,15 @@ type Lease struct {
 	revokec chan struct{}
 }
 
+func NewLease(id LeaseID, ttl int64) *Lease {
+	return &Lease{
+		ID:      id,
+		ttl:     ttl,
+		itemSet: make(map[LeaseItem]struct{}),
+		revokec: make(chan struct{}),
+	}
+}
+
 func (l *Lease) expired() bool {
 	return l.Remaining() <= 0
 }
@@ -861,6 +869,12 @@ func (l *Lease) persistTo(b backend.Backend) {
 // TTL returns the TTL of the Lease.
 func (l *Lease) TTL() int64 {
 	return l.ttl
+}
+
+func (l *Lease) SetLeaseItem(item LeaseItem) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.itemSet[item] = struct{}{}
 }
 
 // RemainingTTL returns the last checkpointed remaining TTL of the lease.

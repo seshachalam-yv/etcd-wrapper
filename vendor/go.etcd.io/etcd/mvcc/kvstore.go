@@ -30,6 +30,7 @@ import (
 	"go.etcd.io/etcd/mvcc/mvccpb"
 	"go.etcd.io/etcd/pkg/schedule"
 	"go.etcd.io/etcd/pkg/traceutil"
+	"go.etcd.io/etcd/version"
 
 	"github.com/coreos/pkg/capnslog"
 	"go.uber.org/zap"
@@ -71,7 +72,8 @@ type ConsistentIndexGetter interface {
 }
 
 type StoreConfig struct {
-	CompactionBatchLimit int
+	CompactionBatchLimit         int
+	NextClusterVersionCompatible bool
 }
 
 type store struct {
@@ -198,7 +200,7 @@ func (s *store) HashByRev(rev int64) (hash uint32, currentRev int64, compactRev 
 	compactRev, currentRev = s.compactMainRev, s.currentRev
 	s.revMu.RUnlock()
 
-	if rev > 0 && rev <= compactRev {
+	if rev > 0 && rev < compactRev {
 		s.mu.RUnlock()
 		return 0, 0, compactRev, ErrCompacted
 	} else if rev > 0 && rev > currentRev {
@@ -378,6 +380,19 @@ func (s *store) restore() error {
 	// restore index
 	tx := s.b.BatchTx()
 	tx.Lock()
+
+	v := UnsafeDetectSchemaVersion(s.lg, tx)
+	if !v.Equal(version.V3_4) && !v.Equal(version.V3_5) {
+		if s.lg != nil {
+			s.lg.Panic("unsupported storage version",
+				zap.String("storage-version", v.String()))
+		} else {
+			plog.Panicf("unsupported storage version: %s\n", v.String())
+		}
+	}
+	if s.cfg.NextClusterVersionCompatible && v.Equal(version.V3_5) {
+		unsafeDowngradeMetaBucket(s.lg, tx)
+	}
 
 	_, finishedCompactBytes := tx.UnsafeRange(metaBucketName, finishedCompactKeyName, nil, 0)
 	if len(finishedCompactBytes) != 0 {
