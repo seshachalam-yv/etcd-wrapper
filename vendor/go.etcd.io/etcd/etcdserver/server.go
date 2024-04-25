@@ -371,7 +371,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 		if err = membership.ValidateClusterAndAssignIDs(cfg.Logger, cl, existingCluster); err != nil {
 			return nil, fmt.Errorf("error validating peerURLs %s: %v", existingCluster, err)
 		}
-		if !isCompatibleWithCluster(cfg.Logger, cl, cl.MemberByName(cfg.Name).ID, prt) {
+		if !isCompatibleWithCluster(cfg.Logger, cl, cl.MemberByName(cfg.Name).ID, prt, cfg.NextClusterVersionCompatible) {
 			return nil, fmt.Errorf("incompatible with current running cluster")
 		}
 
@@ -922,6 +922,18 @@ func (s *EtcdServer) Process(ctx context.Context, m raftpb.Message) error {
 			plog.Warningf("reject message from removed member %s", types.ID(m.From).String())
 		}
 		return httptypes.NewHTTPError(http.StatusForbidden, "cannot process message from removed member")
+	}
+	if s.ID() != types.ID(m.To) {
+		if lg := s.getLogger(); lg != nil {
+			lg.Warn(
+				"rejected Raft message to mismatch member",
+				zap.String("local-member-id", s.ID().String()),
+				zap.String("mismatch-member-id", types.ID(m.To).String()),
+			)
+		} else {
+			plog.Warningf("rejected message to mismatch member %s", types.ID(m.From).String())
+		}
+		return httptypes.NewHTTPError(http.StatusForbidden, "cannot process message to mismatch member")
 	}
 	if m.Type == raftpb.MsgApp {
 		s.stats.RecvAppendReq(types.ID(m.From).String(), m.Size())
@@ -2624,8 +2636,8 @@ func (s *EtcdServer) monitorVersions() {
 		}
 
 		// update cluster version only if the decided version is greater than
-		// the current cluster version
-		if v != nil && s.cluster.Version().LessThan(*v) {
+		// the current cluster version or it is a valid downgrade
+		if v != nil && membership.IsValidClusterVersionChange(s.cluster.Version(), v, s.Config().NextClusterVersionCompatible) {
 			s.goAttach(func() { s.updateClusterVersion(v.String()) })
 		}
 	}
