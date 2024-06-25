@@ -41,7 +41,11 @@ Flags:
 	--etcd-server-name
 		Name of the server (host) which will be used to configure TLS config to connect to the etcd server process.
 	--etcd-ready-timeout
-		time duration the application will wait for etcd to get ready, by default it waits forever.`,
+		time duration the application will wait for etcd to get ready, by default it waits forever.
+	--peer-skip-client-verify
+		Skip verification of SAN field in client certificate for peer connections. This can be helpful e.g. if
+		cluster members run in different networks behind a NAT. In this case make sure to use peer certificates based on
+		a private certificate authority. Defaults to false.`,
 		AddFlags: AddEtcdFlags,
 		Run:      InitAndStartEtcd,
 	}
@@ -60,6 +64,7 @@ func AddEtcdFlags(fs *flag.FlagSet) {
 	fs.IntVar(&config.EtcdClientPort, "etcd-client-port", 2379, "Client port when talking to etcd. Default: 2379")
 	fs.StringVar(&config.EtcdClientTLS.CertPath, "etcd-client-cert-path", "", "File path of ETCD client certificate to help establish TLS communication of the client to ETCD")
 	fs.StringVar(&config.EtcdClientTLS.KeyPath, "etcd-client-key-path", "", "File path of ETCD client key to help establish TLS communication of the client to ETCD")
+	fs.BoolVar(&config.EtcdClientTLS.SkipClientSANVerify, "peer-skip-client-verify", false, "Skip verification of SAN field in client certificate for peer connections.")
 	fs.DurationVar(&etcdReadyTimeout, "etcd-ready-timeout", 0, "Time duration to wait for etcd to be ready")
 }
 

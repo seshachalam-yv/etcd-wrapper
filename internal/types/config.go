@@ -33,6 +33,8 @@ type EtcdClientTLSConfig struct {
 	CertPath string
 	// KeyPath is the path to the client key
 	KeyPath string
+	// Skip verification of SAN field in client certificate for peer connections if this boolean is set to true.
+	SkipClientSANVerify bool
 }
 
 // BackupRestoreConfig defines parameters needed to interact with the backup-restore container
