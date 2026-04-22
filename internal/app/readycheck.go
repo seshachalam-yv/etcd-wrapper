@@ -112,6 +112,7 @@ func (a *Application) isTLSEnabled() bool {
 // startEmbeddedEtcdHandler handles POST /embedded-etcd requests from the steward.
 // It accepts a YAML etcd config in the request body, parses it, and signals that
 // the embedded etcd should be started with the provided configuration.
+// Receiving this request switches the wrapper into steward mode.
 func (a *Application) startEmbeddedEtcdHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -137,10 +138,19 @@ func (a *Application) startEmbeddedEtcdHandler(w http.ResponseWriter, req *http.
 		return
 	}
 
+	// When the steward is joining an existing cluster the peer TLS handshake
+	// may fail SAN verification because the certificates were issued for the
+	// original cluster members. Skip the client SAN check on the peer
+	// transport to allow the new member to connect.
+	cfg.PeerTLSInfo.SkipClientSANVerify = true
+
 	a.mu.Lock()
 	a.cfg = cfg
 	a.embeddedEtcdRequested = true
+	a.stewardMode = true
 	a.mu.Unlock()
+
+	a.logger.Info("received POST /embedded-etcd from steward, switching to steward mode")
 
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte("embedded etcd start requested"))
@@ -185,22 +195,24 @@ func (a *Application) startHTTPServer() {
 		"Starting HTTP server at addr",
 		zap.Int64("Port No: ", int64(a.Config.EtcdWrapperPort)),
 	)
-	a.RegisterHandler()
-	if !a.isTLSEnabled() {
-		err := a.server.ListenAndServe()
+	// RegisterHandler must have been called before startHTTPServer.
+	// When the server is started early (during Setup, before the etcd config
+	// is available) TLS cannot be determined yet, so fall back to plain HTTP.
+	if a.cfg != nil && a.isTLSEnabled() {
+		a.logger.Info("TLS enabled. Starting HTTPS server.")
+		err := a.server.ListenAndServeTLS(a.cfg.ClientTLSInfo.CertFile, a.cfg.ClientTLSInfo.KeyFile)
 		if err != nil && err != http.ErrServerClosed {
 			a.logger.Fatal("Failed to start http server: %v", zap.Error(err))
 		}
-		a.logger.Info("HTTP server closed gracefully.")
+		a.logger.Info("HTTPS server closed gracefully.")
 		return
 	}
 
-	a.logger.Info("TLS enabled. Starting HTTPS server.")
-	err := a.server.ListenAndServeTLS(a.cfg.ClientTLSInfo.CertFile, a.cfg.ClientTLSInfo.KeyFile)
+	err := a.server.ListenAndServe()
 	if err != nil && err != http.ErrServerClosed {
 		a.logger.Fatal("Failed to start http server: %v", zap.Error(err))
 	}
-	a.logger.Info("HTTPS server closed gracefully.")
+	a.logger.Info("HTTP server closed gracefully.")
 }
 
 func (a *Application) stopHTTPServer() error {

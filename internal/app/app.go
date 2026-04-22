@@ -40,6 +40,9 @@ type Application struct {
 	embeddedEtcdRequested bool
 	// manualReadyOverride allows the steward to override the readiness probe via /readyz/set.
 	manualReadyOverride bool
+	// stewardMode indicates that the wrapper is being driven by etcd-steward (POST /embedded-etcd
+	// was received) rather than by the legacy backup-restore sidecar flow.
+	stewardMode bool
 }
 
 // NewApplication initializes and returns an application struct
@@ -60,16 +63,80 @@ func NewApplication(ctx context.Context, cancelFn context.CancelFunc, config typ
 }
 
 // Setup sets up etcd by triggering initialization of the etcd DB.
+// It supports two mutually exclusive flows:
+//
+//   - Legacy flow (backup-restore sidecar): the wrapper polls the sidecar's
+//     /initialization/status endpoint, triggers /initialization/start, then
+//     retrieves the etcd config via GET /config.
+//   - Steward flow (etcd-steward): the steward posts the etcd config to
+//     POST /embedded-etcd. The wrapper does not interact with the sidecar at all.
+//
+// Both paths race: whichever delivers a valid *embed.Config first wins.
+// The HTTP server is started early so that the steward can reach the
+// /embedded-etcd endpoint while the legacy initializer is still running.
 func (a *Application) Setup() error {
-	// Set up etcd
-	cfg, err := a.etcdInitializer.Run(a.ctx)
-	if err != nil {
-		return err
-	}
-	a.cfg = cfg
+	// Start the HTTP server early so the steward can reach /embedded-etcd
+	// before (or instead of) the legacy initializer completing.
+	a.RegisterHandler()
+	go a.startHTTPServer()
 
-	syscall.Umask(0077)
-	return nil
+	cfgChan := make(chan *embed.Config, 1)
+
+	// Path A: Legacy flow — poll the backup-restore sidecar.
+	go func() {
+		cfg, err := a.etcdInitializer.Run(a.ctx)
+		if err != nil {
+			a.logger.Info("legacy initializer did not produce a config", zap.Error(err))
+			return
+		}
+		select {
+		case cfgChan <- cfg:
+			a.logger.Info("etcd config obtained via legacy backup-restore flow")
+		default:
+		}
+	}()
+
+	// Path B: Steward flow — wait for POST /embedded-etcd to set the config.
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			a.mu.Lock()
+			requested := a.embeddedEtcdRequested
+			cfg := a.cfg
+			a.mu.Unlock()
+
+			if requested && cfg != nil {
+				select {
+				case cfgChan <- cfg:
+					a.logger.Info("etcd config obtained via steward flow (POST /embedded-etcd)")
+				default:
+				}
+				return
+			}
+
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+
+	// Wait for either path to deliver a config, or the context to be cancelled.
+	select {
+	case cfg := <-cfgChan:
+		a.mu.Lock()
+		isSteward := a.embeddedEtcdRequested
+		a.mu.Unlock()
+
+		a.stewardMode = isSteward
+		a.cfg = cfg
+		syscall.Umask(0077)
+		return nil
+	case <-a.ctx.Done():
+		return a.ctx.Err()
+	}
 }
 
 // Start sets up readiness probe and starts an embedded etcd.
@@ -90,11 +157,17 @@ func (a *Application) Start() error {
 	a.etcdClient = cli
 	defer a.Close()
 
-	// Setup readiness probe
-	go a.queryAndUpdateEtcdReadiness()
+	// In the legacy flow the wrapper polls etcd to determine readiness.
+	// In the steward flow the steward controls readiness via POST /readyz/set,
+	// so the autonomous polling goroutine is not started.
+	if !a.stewardMode {
+		go a.queryAndUpdateEtcdReadiness()
+	} else {
+		a.logger.Info("steward mode active: readiness is controlled via POST /readyz/set")
+	}
 
-	// start HTTP server to serve endpoints
-	go a.startHTTPServer()
+	// The HTTP server is already running (started in Setup). Ensure it is
+	// stopped when Start returns.
 	defer func() {
 		if err := a.stopHTTPServer(); err != nil {
 			a.logger.Error("unable to stop HTTP server: %v",
