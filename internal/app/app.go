@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +34,12 @@ type Application struct {
 	logger           *zap.Logger
 	etcdReady        bool // should have only one actor that updates it, queryAndUpdateEtcdReadiness()
 	server           *http.Server
+	// mu guards fields that can be modified by HTTP handlers concurrently.
+	mu sync.Mutex
+	// embeddedEtcdRequested is set to true when the steward posts a config to /embedded-etcd.
+	embeddedEtcdRequested bool
+	// manualReadyOverride allows the steward to override the readiness probe via /readyz/set.
+	manualReadyOverride bool
 }
 
 // NewApplication initializes and returns an application struct
@@ -104,6 +111,9 @@ func (a *Application) Start() error {
 	if err = bootstrap.CleanupExitCode(types.DefaultExitCodeFilePath); err != nil {
 		a.logger.Warn("failed to clean-up last captured exit code", zap.Error(err))
 	}
+
+	// Start leadership watcher to push leader info into etcd for steward.
+	go a.watchLeadership(a.ctx)
 
 	// block till application context is cancelled, or there is a notification on etcd.Server.StopNotify channel
 	// or there is an error notification on etcd.Err channel

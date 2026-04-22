@@ -7,7 +7,10 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 	"github.com/gardener/etcd-wrapper/internal/util"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/server/v3/embed"
 	"go.uber.org/zap"
 )
 
@@ -59,9 +63,14 @@ func (a *Application) isEtcdReady() bool {
 	return err == nil
 }
 
-// readinessHandler reads the etcd status from the etcdStatus struct and writes that onto the http responsewriter
+// readinessHandler reads the etcd status from the etcdStatus struct and writes that onto the http responsewriter.
+// It also respects a manual override that can be set via the /readyz/set endpoint.
 func (a *Application) readinessHandler(w http.ResponseWriter, _ *http.Request) {
-	if a.etcdReady {
+	a.mu.Lock()
+	override := a.manualReadyOverride
+	a.mu.Unlock()
+
+	if a.etcdReady || override {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -98,6 +107,68 @@ func (a *Application) isTLSEnabled() bool {
 	return len(strings.TrimSpace(a.cfg.ClientTLSInfo.CertFile)) != 0 &&
 		len(strings.TrimSpace(a.cfg.ClientTLSInfo.KeyFile)) != 0 &&
 		len(strings.TrimSpace(a.cfg.ClientTLSInfo.TrustedCAFile)) != 0
+}
+
+// startEmbeddedEtcdHandler handles POST /embedded-etcd requests from the steward.
+// It accepts a YAML etcd config in the request body, parses it, and signals that
+// the embedded etcd should be started with the provided configuration.
+func (a *Application) startEmbeddedEtcdHandler(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		http.Error(w, "failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	// Write config to temp file so embed.ConfigFromFile can parse it.
+	tmpFile := filepath.Join(os.TempDir(), "etcd-steward-config.yaml")
+	if err := os.WriteFile(tmpFile, body, 0600); err != nil {
+		http.Error(w, "failed to write config", http.StatusInternalServerError)
+		return
+	}
+
+	cfg, err := embed.ConfigFromFile(tmpFile)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid etcd config: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	a.mu.Lock()
+	a.cfg = cfg
+	a.embeddedEtcdRequested = true
+	a.mu.Unlock()
+
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte("embedded etcd start requested"))
+}
+
+// setReadinessHandler handles POST /readyz/set requests from the steward.
+// The body must be either "ready" or "unready" to control the readiness probe override.
+func (a *Application) setReadinessHandler(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, _ := io.ReadAll(req.Body)
+	switch strings.TrimSpace(string(body)) {
+	case "ready":
+		a.mu.Lock()
+		a.manualReadyOverride = true
+		a.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	case "unready":
+		a.mu.Lock()
+		a.manualReadyOverride = false
+		a.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	default:
+		http.Error(w, "body must be 'ready' or 'unready'", http.StatusBadRequest)
+	}
 }
 
 func (a *Application) stopEtcdHandler(w http.ResponseWriter, req *http.Request) {
@@ -141,7 +212,9 @@ func (a *Application) RegisterHandler() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/readyz", a.readinessHandler)
+	mux.HandleFunc("/readyz/set", a.setReadinessHandler)
 	mux.HandleFunc("/stop", a.stopEtcdHandler)
+	mux.HandleFunc("/embedded-etcd", a.startEmbeddedEtcdHandler)
 
 	a.server = &http.Server{
 		Addr:              fmt.Sprintf(":%d", a.Config.EtcdWrapperPort),
