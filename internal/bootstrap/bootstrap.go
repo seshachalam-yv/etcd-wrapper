@@ -20,6 +20,7 @@ import (
 
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.uber.org/zap"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -140,7 +141,47 @@ func (i *initializer) tryGetEtcdConfig(ctx context.Context, maxRetries int, inte
 	}
 	etcdConfigFilePath := opResult.Value
 	i.logger.Info("Fetched and written etcd configuration", zap.String("path", etcdConfigFilePath))
-	return embed.ConfigFromFile(etcdConfigFilePath)
+	cfg, err := embed.ConfigFromFile(etcdConfigFilePath)
+	if err != nil {
+		return nil, err
+	}
+	// embed.ConfigFromFile does not map skip-client-san flags to PeerTLSInfo.SkipClientSANVerify
+	// because the vendored embed/config.go securityConfig struct is missing the field.
+	// Parse the raw YAML to apply it manually.
+	if err := applyPeerSkipClientSANVerify(etcdConfigFilePath, cfg, i.logger); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// peerSkipSANConfig holds only the fields needed to detect whether peer client SAN
+// verification should be disabled. Handles both the etcd 3.4 experimental flag and
+// the etcd 3.5+ peer-transport-security sub-field.
+type peerSkipSANConfig struct {
+	ExperimentalPeerSkipClientSanVerification bool `yaml:"experimental-peer-skip-client-san-verification"`
+	PeerTransportSecurity                     struct {
+		SkipClientSanVerification bool `yaml:"skip-client-san-verification"`
+	} `yaml:"peer-transport-security"`
+}
+
+// applyPeerSkipClientSANVerify reads the raw etcd config file and, if either
+// experimental-peer-skip-client-san-verification (etcd 3.4) or
+// peer-transport-security.skip-client-san-verification (etcd 3.5+) is true,
+// sets cfg.PeerTLSInfo.SkipClientSANVerify so that etcd skips peer client SAN checks.
+func applyPeerSkipClientSANVerify(path string, cfg *embed.Config, logger *zap.Logger) error {
+	b, err := os.ReadFile(path) // #nosec G304 -- path comes from backup-restore GetEtcdConfig, not user input
+	if err != nil {
+		return fmt.Errorf("reading etcd config for peer SAN check: %w", err)
+	}
+	var raw peerSkipSANConfig
+	if err := yaml.Unmarshal(b, &raw); err != nil {
+		return fmt.Errorf("parsing etcd config for peer SAN check: %w", err)
+	}
+	if raw.ExperimentalPeerSkipClientSanVerification || raw.PeerTransportSecurity.SkipClientSanVerification {
+		logger.Info("peer client SAN verification disabled via etcd config")
+		cfg.PeerTLSInfo.SkipClientSANVerify = true
+	}
+	return nil
 }
 
 func determineValidationMode(exitCodeFilePath string, logger *zap.Logger) brclient.ValidationType {
