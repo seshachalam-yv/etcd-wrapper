@@ -20,12 +20,21 @@ import (
 
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.uber.org/zap"
+	"sigs.k8s.io/yaml"
 )
 
 const (
 	defaultBackupRestoreMaxRetries = 5
 	defaultBackOffBetweenRetries   = 1 * time.Second
 )
+
+type peerTransportSecurityConfig struct {
+	SkipClientSANVerification bool `json:"skip-client-san-verification"`
+}
+
+type etcdConfigSkipSAN struct {
+	PeerSecurity peerTransportSecurityConfig `json:"peer-transport-security"`
+}
 
 // EtcdInitializer is an interface for methods to be used to initialize etcd
 type EtcdInitializer interface {
@@ -140,7 +149,30 @@ func (i *initializer) tryGetEtcdConfig(ctx context.Context, maxRetries int, inte
 	}
 	etcdConfigFilePath := opResult.Value
 	i.logger.Info("Fetched and written etcd configuration", zap.String("path", etcdConfigFilePath))
-	return embed.ConfigFromFile(etcdConfigFilePath)
+	cfg, err := embed.ConfigFromFile(etcdConfigFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create embed config from file %s: %w", etcdConfigFilePath, err)
+	}
+	if err = applyPeerSkipClientSANVerify(etcdConfigFilePath, cfg, i.logger); err != nil {
+		return nil, fmt.Errorf("failed to apply peer skip-client-san-verification: %w", err)
+	}
+	return cfg, nil
+}
+
+func applyPeerSkipClientSANVerify(configFilePath string, cfg *embed.Config, logger *zap.Logger) error {
+	data, err := os.ReadFile(configFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to read etcd config file %s: %w", configFilePath, err)
+	}
+	var skipSANConfig etcdConfigSkipSAN
+	if err = yaml.Unmarshal(data, &skipSANConfig); err != nil {
+		return fmt.Errorf("failed to unmarshal etcd config for skip-client-san-verification: %w", err)
+	}
+	if skipSANConfig.PeerSecurity.SkipClientSANVerification {
+		cfg.PeerTLSInfo.SkipClientSANVerify = true
+		logger.Info("Enabled peer skip-client-san-verification on PeerTLSInfo")
+	}
+	return nil
 }
 
 func determineValidationMode(exitCodeFilePath string, logger *zap.Logger) brclient.ValidationType {
