@@ -20,6 +20,7 @@ import (
 
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.uber.org/zap"
+	sigsyaml "sigs.k8s.io/yaml"
 )
 
 const (
@@ -140,7 +141,71 @@ func (i *initializer) tryGetEtcdConfig(ctx context.Context, maxRetries int, inte
 	}
 	etcdConfigFilePath := opResult.Value
 	i.logger.Info("Fetched and written etcd configuration", zap.String("path", etcdConfigFilePath))
-	return embed.ConfigFromFile(etcdConfigFilePath)
+	cfg, err := embed.ConfigFromFile(etcdConfigFilePath)
+	if err != nil {
+		return nil, err
+	}
+	if err = applyPeerSkipClientSANVerify(etcdConfigFilePath, cfg, i.logger); err != nil {
+		return nil, fmt.Errorf("failed to apply peer skip-client-san-verification: %w", err)
+	}
+	return cfg, nil
+}
+
+// peerTransportSecurityConfig is used to unmarshal only the skip-client-san-verification
+// field from the peer-transport-security section of the etcd config YAML. The other TLS
+// fields (cert-file, key-file, trusted-ca-file, client-cert-auth, auto-tls) are already
+// wired into embed.Config.PeerTLSInfo by embed.ConfigFromFile.
+type peerTransportSecurityConfig struct {
+	SkipClientSANVerification bool `json:"skip-client-san-verification"`
+}
+
+// etcdConfigSkipSAN is a minimal struct used to unmarshal only the fields needed for
+// peer SAN-skip support across both etcd 3.4 and etcd 3.5+ config YAML schemas.
+//
+//   - etcd 3.5+ promoted the flag into the peer-transport-security section as
+//     `skip-client-san-verification`.
+//   - etcd 3.4 exposed the same behaviour as a top-level experimental flag named
+//     `experimental-peer-skip-client-san-verification`.
+//
+// We unmarshal both so the wrapper can transparently honour whichever spelling the
+// backup-restore service emits, depending on the etcd version targeted by the
+// druid-rendered config.
+type etcdConfigSkipSAN struct {
+	// PeerSecurity is the etcd 3.5+ section. Only SkipClientSANVerification is read here;
+	// all other peer TLS fields are handled by embed.ConfigFromFile.
+	PeerSecurity peerTransportSecurityConfig `json:"peer-transport-security"`
+	// ExperimentalPeerSkipClientSANVerification is the etcd 3.4 top-level flag.
+	ExperimentalPeerSkipClientSANVerification bool `json:"experimental-peer-skip-client-san-verification"`
+}
+
+// applyPeerSkipClientSANVerify reads the etcd config YAML at configFilePath and sets
+// cfg.PeerTLSInfo.SkipClientSANVerify = true if EITHER:
+//
+//   - the etcd 3.5+ field `peer-transport-security.skip-client-san-verification` is true, OR
+//   - the etcd 3.4 top-level field `experimental-peer-skip-client-san-verification` is true.
+//
+// embed.ConfigFromFile (from go.etcd.io/etcd/server/v3/embed) does not propagate either of
+// these fields into PeerTLSInfo, so we have to re-parse the config file and OR the values
+// into the embed.Config the caller is about to use to start the embedded etcd server.
+//
+// The function never lowers a previously-true SkipClientSANVerify; it only enables it when
+// the YAML requests it. Returning an error means the file could not be read or parsed —
+// the caller is expected to abort startup in that case rather than start etcd with a
+// partially-applied config.
+func applyPeerSkipClientSANVerify(configFilePath string, cfg *embed.Config, logger *zap.Logger) error {
+	data, err := os.ReadFile(configFilePath) // #nosec G304 -- configFilePath is from trusted backup-restore service
+	if err != nil {
+		return fmt.Errorf("failed to read etcd config file %s: %w", configFilePath, err)
+	}
+	var skipSANConfig etcdConfigSkipSAN
+	if err = sigsyaml.Unmarshal(data, &skipSANConfig); err != nil {
+		return fmt.Errorf("failed to unmarshal etcd config for skip-client-san-verification: %w", err)
+	}
+	if skipSANConfig.PeerSecurity.SkipClientSANVerification || skipSANConfig.ExperimentalPeerSkipClientSANVerification {
+		cfg.PeerTLSInfo.SkipClientSANVerify = true
+		logger.Info("Enabled peer skip-client-san-verification on PeerTLSInfo")
+	}
+	return nil
 }
 
 func determineValidationMode(exitCodeFilePath string, logger *zap.Logger) brclient.ValidationType {
